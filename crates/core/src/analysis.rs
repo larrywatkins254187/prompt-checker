@@ -402,8 +402,8 @@ Rules:
 - Be specific and evidence-based. Every mistake must cite the prompt reference(s) it comes from and, where possible, what it led to.
 - Judge prompts in context. A short follow-up such as "yes, do that" is fine when the context makes it clear; do not penalise brevity that worked.
 - Do not invent facts that are not in the transcript. Text shown as [REDACTED] was hidden for privacy; ignore it.
-- Rewrites must keep the developer's intent and language, and show concretely what a better prompt would say.
-- Write in English. Keep each field concise.
+- Rewrites must keep the developer's intent and show concretely what a better prompt would say.
+- Write every field in English, including rewrites, even when the prompts are in another language. Quotes from prompts stay in their original language. Keep each field concise.
 
 Reply with ONLY a JSON object (no markdown fences, no commentary) of this shape:
 {{
