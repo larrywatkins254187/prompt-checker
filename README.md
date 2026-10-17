@@ -34,7 +34,11 @@ Installed copies update themselves. The app checks GitHub Releases when it start
 ### Publishing updates
 
 1. One-time setup: add the updater signing key as a repository secret named `TAURI_SIGNING_PRIVATE_KEY` (GitHub → Settings → Secrets and variables → Actions → New repository secret; paste the whole content of the private key file). The matching public key is in `src-tauri/tauri.conf.json`. Keep the private key safe: without it no update can ever be published for installed copies.
-2. Push a version tag, e.g. `git tag v0.3.0 && git push origin v0.3.0`. The **Release** job builds and signs the installer with that version number and publishes a GitHub release with `latest.json`, which installed apps pick up.
+2. Publish a version, either way:
+   - push a version tag, e.g. `git tag v0.3.0 && git push origin v0.3.0`, or
+   - GitHub → Actions → **Build** → **Run workflow**, pick the branch, enter the version (e.g. `0.3.0`).
+
+   The **Release** job builds and signs the installer with that version number and publishes a GitHub release (tag `v0.3.0`) with `latest.json`, which installed apps pick up. Each release needs a higher version number than the last.
 
 Version 0.1.0 had no updater: install 0.2.0 (or later) once by hand; from then on updates are automatic.
 
