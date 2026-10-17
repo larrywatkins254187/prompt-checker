@@ -16,9 +16,9 @@ fn main() -> anyhow::Result<()> {
         println!("\n== {} ({}) sessions={} prompts={} cost={:?}", p.name, p.location, p.session_count, p.prompt_count, p.est_cost);
         for s in db.list_sessions(p.id)? {
             println!("  - {} {} prompts={} tools={} errors={} tokens={:?} models={:?}", s.external_id, s.started_at.as_deref().unwrap_or(""), s.prompt_count, s.tool_call_count, s.error_count, s.tokens, s.models);
-            let req = AnalysisRequest { scope: Scope::Session, target_id: Some(s.id), mode: ContextMode::Condensed, model: "x".into(), draft_text: None, draft_context: None };
+            let req = AnalysisRequest { scope: Scope::Session, target_id: Some(s.id), mode: ContextMode::Condensed, model: "x".into(), draft_text: None, draft_context: None, project_dir: None, project_id: None };
             let criteria = db.list_criteria()?;
-            match build_context(&db, &req, &criteria, 600_000, true) {
+            match build_context(&db, &req, &criteria, 1_000_000, true) {
                 Ok(c) => println!("    context: {} chars (~{} tokens), {} prompts\n{}", c.chars, c.est_tokens, c.prompt_count, c.user_prompt.chars().take(1500).collect::<String>()),
                 Err(e) => println!("    context error: {e}"),
             }

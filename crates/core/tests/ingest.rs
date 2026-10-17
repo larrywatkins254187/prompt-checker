@@ -78,9 +78,19 @@ fn imports_incrementally_and_survives_deleted_files() {
     ingest_all(&db, &sources, &opts);
     assert_eq!(db.list_sessions(projects[0].id).unwrap().len(), 2);
 
-    let stats = db.stats(36500).unwrap();
-    assert_eq!(stats.sessions, 2);
-    assert_eq!(stats.prompts, 2);
+    let usage = db
+        .usage(&pc_core::usage::UsageRange {
+            from: "2025-12-31T00:00:00Z".into(),
+            to: "2026-01-03T00:00:00Z".into(),
+            tz_offset_minutes: 0,
+            bucket: pc_core::usage::BucketSize::Day,
+        })
+        .unwrap();
+    // Only the Claude session has timestamps; the Codex fixture has none.
+    assert_eq!(usage.totals.sessions, 1);
+    assert_eq!(usage.totals.prompts, 1);
+    assert_eq!(usage.totals.tokens.output, 1000);
+    assert_eq!(usage.buckets.len(), 3);
 }
 
 #[test]
@@ -106,4 +116,48 @@ fn excludes_analysis_workdir_and_merges_projects() {
     let projects = db.list_projects().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(projects[0].session_count, 2);
+}
+
+#[test]
+fn upgrades_a_v1_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    {
+        // Recreate what v0.1 left on disk: no token columns, the old 7-criterion rubric.
+        let db = Db::open(&path).unwrap();
+        db.conn
+            .execute_batch(
+                "ALTER TABLE analyses DROP COLUMN input_tokens;
+                 ALTER TABLE analyses DROP COLUMN output_tokens;
+                 ALTER TABLE analyses DROP COLUMN cache_read_tokens;
+                 ALTER TABLE analyses DROP COLUMN cache_creation_tokens;
+                 ALTER TABLE analyses DROP COLUMN project_path;
+                 DELETE FROM criteria;
+                 INSERT INTO analyses(scope, model, context_mode, status, created_at) VALUES ('global', 'm', 'full', 'done', '2026-01-01T00:00:00Z');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        for (i, k) in ["clarity", "context", "success", "scope", "constraints", "feedback", "efficiency"].iter().enumerate() {
+            db.conn
+                .execute("INSERT INTO criteria(key, name, description, sort) VALUES (?1, ?1, 'd', ?2)", rusqlite_params(k, i))
+                .unwrap();
+        }
+    }
+    let db = Db::open(&path).unwrap();
+    let keys: Vec<String> = db.list_criteria().unwrap().into_iter().map(|c| c.key).collect();
+    assert_eq!(keys.len(), 10);
+    assert_eq!(keys[0], "goal");
+    let a = &db.list_analyses(None, None).unwrap()[0];
+    assert!(a.tokens.is_none(), "old analyses have no token data");
+
+    // A rubric the user edited is left alone.
+    db.save_criteria(&[pc_core::db::Criterion { id: None, key: "mine".into(), name: "Mine".into(), description: "x".into(), weight: 1.0, enabled: true }])
+        .unwrap();
+    drop(db);
+    let db = Db::open(&path).unwrap();
+    assert_eq!(db.list_criteria().unwrap().len(), 1);
+}
+
+fn rusqlite_params(k: &str, i: usize) -> (String, i64) {
+    (k.to_string(), i as i64)
 }

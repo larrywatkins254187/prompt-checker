@@ -2,6 +2,7 @@
 //! background importer.
 
 mod settings;
+mod updater;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,9 +13,10 @@ use std::time::Duration;
 use pc_core::analysis::{self, AnalysisRequest, BuiltContext};
 use pc_core::db::{
     AnalysisRow, Criterion, Db, MessageRow, NewAnalysis, ProjectSummary, PromptScore, SearchHit, SessionDetail,
-    SessionSummary, Stats,
+    SessionSummary, ScorePoint, Counts,
 };
 use pc_core::ingest::{self, IngestOptions, IngestReport, SourceConfig};
+use pc_core::usage::{UsageRange, UsageReport};
 use pc_core::{claude_settings, cli, export};
 use serde::Serialize;
 use settings::AppSettings;
@@ -235,8 +237,37 @@ fn search(state: State<AppState>, query: String, kinds: Vec<String>, project_id:
 }
 
 #[tauri::command]
-fn stats(state: State<AppState>, days: Option<i64>) -> CmdResult<Stats> {
-    state.db.lock().unwrap().stats(days.unwrap_or(90)).map_err(err)
+fn usage(state: State<AppState>, range: UsageRange) -> CmdResult<UsageReport> {
+    state.db.lock().unwrap().usage(&range).map_err(err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Dashboard {
+    counts: Counts,
+    recent_sessions: Vec<SessionSummary>,
+    recent_analyses: Vec<AnalysisRow>,
+    score_history: Vec<ScorePoint>,
+}
+
+/// Everything the dashboard needs that is not range-based usage.
+#[tauri::command]
+fn dashboard(state: State<AppState>, score_since: String) -> CmdResult<Dashboard> {
+    let db = state.db.lock().unwrap();
+    let mut recent_analyses = db.list_analyses(None, None).map_err(err)?;
+    recent_analyses.truncate(8);
+    Ok(Dashboard {
+        counts: db.counts().map_err(err)?,
+        recent_sessions: db.recent_sessions(8).map_err(err)?,
+        recent_analyses,
+        score_history: db.score_history(&score_since).map_err(err)?,
+    })
+}
+
+/// Sessions with activity since `since` (UTC ISO), for "Analyse today's sessions".
+#[tauri::command]
+fn sessions_active_since(state: State<AppState>, since: String) -> CmdResult<Vec<SessionSummary>> {
+    state.db.lock().unwrap().sessions_active_since(&since).map_err(err)
 }
 
 // ------------------------------------------------------------------ rubric
@@ -277,8 +308,22 @@ fn cli_config(state: &AppState) -> cli::CliConfig {
 fn build(state: &AppState, req: &AnalysisRequest) -> anyhow::Result<BuiltContext> {
     let s = state.settings();
     let db = state.db.lock().unwrap();
+    let mut req = req.clone();
+    // A draft reviewed against an imported project: use that project's folder.
+    if req.scope == analysis::Scope::Draft && req.project_dir.is_none() {
+        if let Some(pid) = req.project_id {
+            let (path, location) = db.project_folder(pid)?;
+            let path = path.ok_or_else(|| anyhow::anyhow!("This project has no folder recorded"))?;
+            req.project_dir = Some(ingest::wsl::host_path(&location, &path).to_string_lossy().into_owned());
+        }
+    }
     let criteria: Vec<Criterion> = db.list_criteria()?.into_iter().filter(|c| c.enabled).collect();
-    analysis::build_context(&db, req, &criteria, s.max_context_chars, s.redact)
+    analysis::build_context(&db, &req, &criteria, s.max_input_tokens, s.redact)
+}
+
+/// True while any analysis is running (the updater waits for them).
+pub(crate) fn analysis_running(app: &AppHandle) -> bool {
+    !app.state::<AppState>().cancels.lock().unwrap().is_empty()
 }
 
 #[tauri::command]
@@ -319,6 +364,7 @@ fn start_analysis(app: AppHandle, state: State<AppState>, request: AnalysisReque
             input_text: request.draft_text.as_deref(),
             ref_map: Some(&built.ref_map),
             truncated: built.truncated,
+            project_path: built.project_dir.as_deref(),
         })
         .map_err(err)?
     };
@@ -330,23 +376,24 @@ fn start_analysis(app: AppHandle, state: State<AppState>, request: AnalysisReque
 
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
-        let outcome = cli::run(&cfg, &model, &built.system_prompt, &built.user_prompt, cancel);
+        let project_dir = built.project_dir.as_deref().map(std::path::Path::new);
+        let outcome = cli::run(&cfg, &model, &built.system_prompt, &built.user_prompt, project_dir, cancel);
         let status = match state.open_db() {
             Ok(db) => {
                 let criteria = db.list_criteria().unwrap_or_default();
                 match outcome {
                     Ok(res) => match analysis::parse_result(&res.text, &criteria) {
                         Ok((value, score)) => {
-                            let _ = db.finish_analysis(id, score, &value, &res.raw, res.cost_usd, res.duration_ms);
+                            let _ = db.finish_analysis(id, score, &value, &res.raw, res.cost_usd, res.duration_ms, res.usage.as_ref());
                             "done"
                         }
                         Err(e) => {
-                            let _ = db.fail_analysis(id, &err(e), Some(&res.raw));
+                            let _ = db.fail_analysis(id, &err(e), Some(&res.raw), res.cost_usd, res.usage.as_ref());
                             "error"
                         }
                     },
                     Err(e) => {
-                        let _ = db.fail_analysis(id, &err(e), None);
+                        let _ = db.fail_analysis(id, &err(e), None, None, None);
                         "error"
                     }
                 }
@@ -410,12 +457,31 @@ fn export_analysis(state: State<AppState>, id: i64, format: String, path: String
     std::fs::write(&path, text).map_err(err)
 }
 
+// ------------------------------------------------------------------ updates
+
+#[tauri::command]
+fn update_status(app: AppHandle) -> updater::UpdateStatus {
+    updater::status(&app)
+}
+
+#[tauri::command]
+async fn check_for_updates(app: AppHandle) -> CmdResult<updater::UpdateStatus> {
+    updater::check(&app, false).await
+}
+
+#[tauri::command]
+fn install_update(app: AppHandle) -> CmdResult<()> {
+    updater::install_now(&app)
+}
+
 // ------------------------------------------------------------------ app
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updater::UpdaterState::default())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -434,6 +500,7 @@ pub fn run() {
                 cancels: Mutex::new(HashMap::new()),
             });
             start_poller(app.handle().clone());
+            updater::start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -456,7 +523,12 @@ pub fn run() {
             message_session,
             prompt_scores,
             search,
-            stats,
+            usage,
+            dashboard,
+            sessions_active_since,
+            update_status,
+            check_for_updates,
+            install_update,
             list_criteria,
             save_criteria,
             reset_criteria,

@@ -17,8 +17,8 @@ pub struct AppSettings {
     pub models: Vec<String>,
     pub default_model: String,
     pub default_mode: ContextMode,
-    /// Upper bound on characters sent to the model in one analysis.
-    pub max_context_chars: usize,
+    /// Upper bound on (estimated) input tokens sent to the model in one analysis.
+    pub max_input_tokens: usize,
     /// Mask secrets before sending anything to the model.
     pub redact: bool,
     pub poll_seconds: u64,
@@ -34,7 +34,7 @@ impl Default for AppSettings {
             models: DEFAULT_MODELS.iter().map(|s| s.to_string()).collect(),
             default_model: DEFAULT_MODELS[0].to_string(),
             default_mode: ContextMode::Condensed,
-            max_context_chars: 600_000,
+            max_input_tokens: 1_000_000,
             redact: true,
             poll_seconds: 30,
             timeout_minutes: 15,
@@ -59,7 +59,7 @@ impl AppSettings {
         if s.models.is_empty() {
             s.models = AppSettings::default().models;
         }
-        s.max_context_chars = s.max_context_chars.clamp(20_000, 4_000_000);
+        s.max_input_tokens = s.max_input_tokens.clamp(50_000, 4_000_000);
         s.poll_seconds = s.poll_seconds.clamp(5, 3600);
         s.timeout_minutes = s.timeout_minutes.clamp(1, 120);
         db.set_setting(KEY, &serde_json::to_string(&s)?)

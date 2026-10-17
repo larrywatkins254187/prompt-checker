@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from "react";
 import { scoreClass } from "../lib/format";
 
 const paths: Record<string, ReactNode> = {
+  home: <path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z" />,
   folder: <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />,
   search: (
     <>

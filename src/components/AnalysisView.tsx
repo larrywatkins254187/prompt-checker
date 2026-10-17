@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { api, onEvent, type AnalysisEvent, type AnalysisRow, type Criterion, type RefEntry } from "../api";
-import { errorMessage, fmtCost, fmtDate, fmtDuration } from "../lib/format";
+import { errorMessage, fmtCost, fmtDate, fmtDuration, fmtNum, totalTokens } from "../lib/format";
 import { useAsync } from "../lib/hooks";
 import { useNav } from "../lib/router";
 import { AnalyzeDialog } from "./AnalyzeDialog";
@@ -74,7 +74,7 @@ function useCriterionNames(): Map<string, string> {
 }
 
 /** Running / failed / finished analysis, rendered in full. */
-export function AnalysisBody({ a, compact }: { a: AnalysisRow; compact?: boolean }) {
+export function AnalysisBody({ a, compact, showUsage = true }: { a: AnalysisRow; compact?: boolean; showUsage?: boolean }) {
   const nav = useNav();
   const names = useCriterionNames();
   if (a.status === "running") {
@@ -116,6 +116,16 @@ export function AnalysisBody({ a, compact }: { a: AnalysisRow; compact?: boolean
             <div className="dir-auto" style={{ fontSize: 15 }}>
               {r.summary || <span className="muted">No summary</span>}
             </div>
+            {showUsage && a.tokens && (
+              <div className="meta-line" style={{ marginTop: 8 }}>
+                <span>{a.model}</span>
+                <span>
+                  {fmtNum(a.tokens.input)} in · {fmtNum(a.tokens.output)} out · {fmtNum(a.tokens.cacheRead + a.tokens.cacheCreation)} cache
+                </span>
+                {a.costUsd != null && <span>{fmtCost(a.costUsd)}</span>}
+                {a.durationMs != null && <span>{fmtDuration(a.durationMs)}</span>}
+              </div>
+            )}
           </div>
         </div>
         {a.truncated && (
@@ -341,6 +351,7 @@ export function AnalysisPage({ id }: { id: number }) {
             <span>{fmtDate(a.createdAt)}</span>
             {a.durationMs != null && <span>Took {fmtDuration(a.durationMs)}</span>}
             {a.costUsd != null && <span title="As reported by the Claude CLI (list price; subscriptions are not billed per token)">CLI cost {fmtCost(a.costUsd)}</span>}
+            {a.projectPath && <span title="The model explored this folder (read-only)">Project: {a.projectPath}</span>}
           </div>
         </div>
         <div className="row wrap">
@@ -367,6 +378,30 @@ export function AnalysisPage({ id }: { id: number }) {
         </div>
       </div>
 
+      {a.tokens && (
+        <div className="tiles" style={{ marginBottom: 12 }}>
+          <div className="tile" title="New (uncached) input tokens">
+            <div className="label">Input tokens</div>
+            <div className="value">{fmtNum(a.tokens.input)}</div>
+          </div>
+          <div className="tile">
+            <div className="label">Output tokens</div>
+            <div className="value">{fmtNum(a.tokens.output)}</div>
+          </div>
+          <div className="tile" title="Input read from / written to the prompt cache">
+            <div className="label">Cache read / write</div>
+            <div className="value">
+              {fmtNum(a.tokens.cacheRead)} / {fmtNum(a.tokens.cacheCreation)}
+            </div>
+          </div>
+          <div className="tile">
+            <div className="label">Total tokens</div>
+            <div className="value">{fmtNum(totalTokens(a.tokens))}</div>
+            <div className="sub">{a.costUsd != null ? `${fmtCost(a.costUsd)} at list price` : ""}</div>
+          </div>
+        </div>
+      )}
+
       {a.status === "done" && others.length > 0 && (
         <div className="row" style={{ marginBottom: 12 }}>
           <span className="muted small">Compare with</span>
@@ -382,7 +417,7 @@ export function AnalysisPage({ id }: { id: number }) {
       )}
       {other && <div style={{ marginBottom: 12 }}><Compare a={a} b={other} /></div>}
 
-      <AnalysisBody a={a} />
+      <AnalysisBody a={a} showUsage={false} />
 
       {rerun && (
         <AnalyzeDialog
@@ -415,6 +450,7 @@ export function AnalysisList({ items, onOpen }: { items: AnalysisRow[]; onOpen: 
             <div className="muted small">
               {a.scope === "prompt" || a.scope === "draft" ? `${a.model} · ` : ""}
               {MODE_LABEL[a.contextMode]} · {fmtDate(a.createdAt)}
+              {a.tokens ? ` · ${fmtNum(totalTokens(a.tokens))} tok` : ""}
             </div>
           </div>
         </div>

@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
+use crate::model::Usage;
+
 #[derive(Debug, Clone)]
 pub struct CliConfig {
     /// Explicit path to the `claude` executable; auto-detected when `None`.
@@ -25,8 +27,13 @@ pub struct CliResult {
     pub text: String,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<i64>,
+    /// Tokens used by the whole run (all turns and models).
+    pub usage: Option<Usage>,
     pub raw: String,
 }
+
+/// Read-only tools the reviewer may use when it is given a project folder.
+pub const READ_ONLY_TOOLS: &str = "Read,Glob,Grep";
 
 #[cfg(windows)]
 const EXTENSIONS: &[&str] = &[".exe", ".cmd", ".bat", ""];
@@ -92,11 +99,11 @@ struct Output {
     stderr: String,
 }
 
-fn run_process(program: &Path, args: &[String], stdin_text: &str, cfg: &CliConfig, cancel: &AtomicBool) -> Result<Output> {
+fn run_process(program: &Path, args: &[String], stdin_text: &str, cwd: &Path, cfg: &CliConfig, cancel: &AtomicBool) -> Result<Output> {
     std::fs::create_dir_all(&cfg.workdir).ok();
     let mut child = command(program)
         .args(args)
-        .current_dir(&cfg.workdir)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -147,7 +154,23 @@ fn run_process(program: &Path, args: &[String], stdin_text: &str, cfg: &CliConfi
 
 /// Run one analysis. The system prompt is passed as a file (falling back to an inline
 /// argument for older CLI versions); the transcript is sent on stdin.
-pub fn run(cfg: &CliConfig, model: &str, system_prompt: &str, user_prompt: &str, cancel: Arc<AtomicBool>) -> Result<CliResult> {
+///
+/// Without `project_dir` the model gets no tools at all and runs in the empty app work
+/// folder. With it, the CLI runs inside that folder with read-only tools only.
+pub fn run(
+    cfg: &CliConfig,
+    model: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    project_dir: Option<&Path>,
+    cancel: Arc<AtomicBool>,
+) -> Result<CliResult> {
+    if let Some(dir) = project_dir {
+        if !dir.is_dir() {
+            bail!("Project folder not found: {}", dir.display());
+        }
+    }
+    let cwd = project_dir.unwrap_or(&cfg.workdir);
     let program = resolve_claude(cfg.path.as_deref())?;
     std::fs::create_dir_all(&cfg.workdir).ok();
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -161,15 +184,24 @@ pub fn run(cfg: &CliConfig, model: &str, system_prompt: &str, user_prompt: &str,
         a
     };
     let sys_path = sys_file.to_string_lossy().to_string();
-    let attempts: Vec<Vec<String>> = vec![
-        base(&["--system-prompt-file", &sys_path, "--tools", "", "--no-session-persistence", "--strict-mcp-config"]),
-        // Older CLI versions: fewer flags, inline system prompt.
-        base(&["--system-prompt", system_prompt]),
-    ];
+    let attempts: Vec<Vec<String>> = if project_dir.is_some() {
+        let tools = ["--tools", READ_ONLY_TOOLS, "--allowedTools", READ_ONLY_TOOLS, "--permission-mode", "dontAsk"];
+        let mut first = vec!["--system-prompt-file", sys_path.as_str(), "--no-session-persistence", "--strict-mcp-config"];
+        first.extend(tools);
+        let mut fallback = vec!["--system-prompt", system_prompt];
+        fallback.extend(["--allowedTools", READ_ONLY_TOOLS]);
+        vec![base(&first), base(&fallback)]
+    } else {
+        vec![
+            base(&["--system-prompt-file", &sys_path, "--tools", "", "--no-session-persistence", "--strict-mcp-config"]),
+            // Older CLI versions: fewer flags, inline system prompt.
+            base(&["--system-prompt", system_prompt]),
+        ]
+    };
 
     let mut last_err = None;
     for args in attempts {
-        let out = run_process(&program, &args, user_prompt, cfg, &cancel);
+        let out = run_process(&program, &args, user_prompt, cwd, cfg, &cancel);
         let out = match out {
             Ok(o) => o,
             Err(e) => {
@@ -213,7 +245,30 @@ pub fn parse_cli_output(stdout: &str, stderr: &str, ok: bool) -> Result<CliResul
         text,
         cost_usd: v.get("total_cost_usd").or_else(|| v.get("cost_usd")).and_then(Value::as_f64),
         duration_ms: v.get("duration_ms").and_then(Value::as_i64),
+        usage: usage_of(&v),
         raw: stdout.to_string(),
+    })
+}
+
+/// Total tokens of a run: `modelUsage` sums every model involved (e.g. after a fallback);
+/// older CLI versions only report `usage`.
+fn usage_of(v: &Value) -> Option<Usage> {
+    let int = |o: &Value, k: &str| o.get(k).and_then(Value::as_i64).unwrap_or(0);
+    if let Some(models) = v.get("modelUsage").and_then(Value::as_object).filter(|m| !m.is_empty()) {
+        let mut u = Usage::default();
+        for m in models.values() {
+            u.input_tokens += int(m, "inputTokens");
+            u.output_tokens += int(m, "outputTokens");
+            u.cache_read_tokens += int(m, "cacheReadInputTokens");
+            u.cache_creation_tokens += int(m, "cacheCreationInputTokens");
+        }
+        return Some(u);
+    }
+    v.get("usage").filter(|u| u.is_object()).map(|u| Usage {
+        input_tokens: int(u, "input_tokens"),
+        output_tokens: int(u, "output_tokens"),
+        cache_read_tokens: int(u, "cache_read_input_tokens"),
+        cache_creation_tokens: int(u, "cache_creation_input_tokens"),
     })
 }
 
@@ -232,6 +287,16 @@ mod tests {
         assert_eq!(r.text, "{\"overall_score\":7}");
         assert_eq!(r.cost_usd, Some(0.05));
         assert_eq!(r.duration_ms, Some(1234));
+        assert_eq!(r.usage, None);
+    }
+
+    #[test]
+    fn reads_token_usage() {
+        let out = r#"{"type":"result","subtype":"success","is_error":false,"result":"{}","usage":{"input_tokens":6,"output_tokens":322,"cache_read_input_tokens":8173,"cache_creation_input_tokens":4374},"modelUsage":{"claude-haiku-5-5":{"inputTokens":6,"outputTokens":322,"cacheReadInputTokens":8173,"cacheCreationInputTokens":4374},"claude-opus-5-5":{"inputTokens":1,"outputTokens":1,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}"#;
+        let u = parse_cli_output(out, "", true).unwrap().usage.unwrap();
+        assert_eq!((u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_creation_tokens), (7, 323, 8173, 4374));
+        let only_usage = r#"{"type":"result","subtype":"success","result":"{}","usage":{"input_tokens":2,"output_tokens":3}}"#;
+        assert_eq!(parse_cli_output(only_usage, "", true).unwrap().usage.unwrap().output_tokens, 3);
     }
 
     #[test]

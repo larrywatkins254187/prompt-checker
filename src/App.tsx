@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { onEvent, type AnalysisEvent, type IngestStatus } from "./api";
+import { api, onEvent, type AnalysisEvent, type IngestStatus } from "./api";
+import { errorMessage } from "./lib/format";
+import { useUpdateStatus } from "./lib/update";
+import { DashboardPage } from "./pages/DashboardPage";
 import { NavContext, type Nav, type Route } from "./lib/router";
 import { Icon } from "./components/ui";
 import { AnalysisPage } from "./components/AnalysisView";
@@ -24,6 +27,7 @@ function readTheme(): Theme {
 }
 
 const NAV: { route: Route; label: string; icon: string; match: Route["name"][] }[] = [
+  { route: { name: "dashboard" }, label: "Dashboard", icon: "home", match: ["dashboard"] },
   { route: { name: "projects" }, label: "Projects", icon: "folder", match: ["projects", "project", "session"] },
   { route: { name: "search" }, label: "Search", icon: "search", match: ["search"] },
   { route: { name: "insights" }, label: "Overall insights", icon: "sparkle", match: ["insights"] },
@@ -33,7 +37,8 @@ const NAV: { route: Route; label: string; icon: string; match: Route["name"][] }
 ];
 
 export default function App() {
-  const [stack, setStack] = useState<Route[]>([{ name: "projects" }]);
+  const [stack, setStack] = useState<Route[]>([{ name: "dashboard" }]);
+  const update = useUpdateStatus();
   const [version, setVersion] = useState(0);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [theme, setTheme] = useState<Theme>(readTheme);
@@ -90,6 +95,8 @@ export default function App() {
 
   const page = (() => {
     switch (route.name) {
+      case "dashboard":
+        return <DashboardPage />;
       case "projects":
         return <ProjectsPage />;
       case "project":
@@ -131,6 +138,25 @@ export default function App() {
             </button>
           ))}
           <div className="sidebar-footer">
+            {update?.state === "ready" && (
+              <div className="update-chip">
+                <span>Version {update.latestVersion} is ready</span>
+                <button
+                  className="btn primary sm"
+                  onClick={() => api.installUpdate().catch((e) => toast(errorMessage(e)))}
+                >
+                  Restart to update
+                </button>
+              </div>
+            )}
+            {update?.state === "downloading" && (
+              <div className="update-chip">
+                <span>Downloading update…</span>
+                <div className="progress">
+                  <div style={{ width: `${Math.round((update.progress ?? 0) * 100)}%` }} />
+                </div>
+              </div>
+            )}
             <button className="nav-item" onClick={() => setTheme(nextTheme[theme])} title="Switch theme">
               <Icon name={theme === "dark" ? "moon" : "sun"} /> Theme: {theme}
             </button>

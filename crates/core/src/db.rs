@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::model::{ParsedSession, Usage};
 use crate::pricing;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
@@ -130,23 +130,29 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 "#;
 
+/// Keys of the rubric shipped in v0.1.0, used to upgrade it when the user never edited it.
+const V1_DEFAULT_KEYS: &[&str] = &["clarity", "context", "success", "scope", "constraints", "feedback", "efficiency"];
+
 pub fn default_criteria() -> Vec<Criterion> {
-    let c = |key: &str, name: &str, description: &str| Criterion {
+    let c = |key: &str, name: &str, weight: f64, description: &str| Criterion {
         id: None,
         key: key.into(),
         name: name.into(),
         description: description.into(),
-        weight: 1.0,
+        weight,
         enabled: true,
     };
     vec![
-        c("clarity", "Clarity & specificity", "Is the request unambiguous? Does it say exactly what to build, change or answer, instead of leaving the model to guess?"),
-        c("context", "Context", "Does it give the background the model needs: relevant files, current behaviour, error messages, why the change is wanted?"),
-        c("success", "Success criteria", "Does it define what 'done' looks like and how to verify it (tests to pass, expected output, acceptance checks)?"),
-        c("scope", "Scope & decomposition", "Is the task sized sensibly? Large work split into steps, unrelated asks not mixed into one prompt?"),
-        c("constraints", "Constraints & preferences", "Are technology choices, style, things to avoid and limits stated up front rather than discovered after the model gets them wrong?"),
-        c("feedback", "Feedback quality", "When correcting the model, are follow-ups precise (what was wrong, what to do instead) rather than vague ('still broken', 'try again')?"),
-        c("efficiency", "Efficiency", "Does the prompting avoid wasted turns and tokens: repeated instructions, needless back-and-forth, re-explaining things already said?"),
+        c("goal", "Clear goal", 1.5, "Does the prompt say what outcome is wanted and why, so the agent knows what problem it is solving rather than only what to type?"),
+        c("specificity", "Specific requirements", 1.5, "Are the exact behaviour, inputs and outputs, names, files or UI details stated, leaving nothing important for the agent to guess?"),
+        c("context", "Relevant context", 1.5, "Does it give what the agent cannot discover on its own: relevant files or modules, current behaviour, error messages and logs, what was already tried, links to specs?"),
+        c("success", "Success criteria & verification", 1.5, "Does it define 'done' and how to check it: tests to run or write, expected output, acceptance checks, commands that must pass?"),
+        c("constraints", "Constraints & boundaries", 1.0, "Are technology choices, conventions, performance or compatibility limits, and what must NOT be changed stated up front instead of being corrected afterwards?"),
+        c("scope", "Scope & task size", 1.0, "Is each request a sensible unit of work: large work split into steps or a plan first, unrelated asks not mixed into one prompt, no scope creep mid-task?"),
+        c("examples", "Examples & references", 0.5, "Where it helps, does it point to concrete examples, existing code to imitate, sample input/output or screenshots instead of describing them vaguely?"),
+        c("collaboration", "Working with the agent", 1.0, "Does the developer use the agent well: asking for a plan or clarifying questions on ambiguous or risky tasks, answering its questions clearly, and stating which decisions the agent may make alone?"),
+        c("feedback", "Feedback & corrections", 1.0, "When something goes wrong, are follow-ups precise (what is wrong, evidence such as errors or output, what to do instead) rather than vague ('still broken', 'try again')?"),
+        c("efficiency", "Efficiency", 0.5, "Does the prompting avoid wasted turns and tokens: no repeated instructions, related asks batched, no re-explaining what was already said, no needless back-and-forth?"),
     ]
 }
 
@@ -276,6 +282,10 @@ pub struct AnalysisRow {
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<i64>,
     pub truncated: bool,
+    /// Tokens the Claude CLI used to produce this analysis (None for runs from v0.1).
+    pub tokens: Option<Tokens>,
+    /// Draft scope: project folder the model was allowed to explore.
+    pub project_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -286,59 +296,23 @@ pub struct PromptScore {
     pub analysis_id: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Stats {
+pub struct ScorePoint {
+    pub analysis_id: i64,
+    pub created_at: String,
+    pub score: f64,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Counts {
     pub projects: i64,
     pub sessions: i64,
     pub prompts: i64,
-    pub tool_calls: i64,
-    pub tool_errors: i64,
-    pub tokens: Tokens,
-    pub est_cost: f64,
     pub analyses: i64,
-    pub by_day: Vec<DayStat>,
-    pub by_model: Vec<ModelStat>,
-    pub by_project: Vec<ProjectStat>,
-    pub by_source: Vec<SourceStat>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DayStat {
-    pub day: String,
-    pub sessions: i64,
-    pub prompts: i64,
-    pub est_cost: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelStat {
-    pub model: String,
-    pub responses: i64,
-    pub output_tokens: i64,
-    pub est_cost: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectStat {
-    pub project_id: i64,
-    pub name: String,
-    pub sessions: i64,
-    pub prompts: i64,
-    pub output_tokens: i64,
-    pub est_cost: f64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SourceStat {
-    pub source: String,
-    pub location: String,
-    pub sessions: i64,
-    pub prompts: i64,
+    pub running_analyses: i64,
 }
 
 /// New analysis to be recorded before the CLI runs.
@@ -350,6 +324,7 @@ pub struct NewAnalysis<'a> {
     pub input_text: Option<&'a str>,
     pub ref_map: Option<&'a Value>,
     pub truncated: bool,
+    pub project_path: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +434,8 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionSummary> {
 }
 
 const ANALYSIS_COLS: &str = "id, scope, target_id, model, context_mode, status, created_at, finished_at, overall_score, \
-    result_json, ref_map_json, input_text, raw_output, error, cost_usd, duration_ms, truncated";
+    result_json, ref_map_json, input_text, raw_output, error, cost_usd, duration_ms, truncated, \
+    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, project_path";
 
 fn analysis_from_row(r: &Row) -> rusqlite::Result<AnalysisRow> {
     let parse = |s: Option<String>| s.and_then(|s| serde_json::from_str::<Value>(&s).ok());
@@ -482,6 +458,11 @@ fn analysis_from_row(r: &Row) -> rusqlite::Result<AnalysisRow> {
         cost_usd: r.get(14)?,
         duration_ms: r.get(15)?,
         truncated: r.get::<_, i64>(16)? != 0,
+        tokens: match (r.get::<_, Option<i64>>(17)?, r.get::<_, Option<i64>>(18)?) {
+            (None, None) => None,
+            _ => Some(tokens_from(r, 17)?),
+        },
+        project_path: r.get(21)?,
     })
 }
 
@@ -502,13 +483,32 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < SCHEMA_VERSION {
+        if version < 1 {
             conn.execute_batch(SCHEMA)?;
+        }
+        if version < 2 {
+            // Token usage of each analysis run, and the project folder a draft was reviewed against.
+            conn.execute_batch(
+                "ALTER TABLE analyses ADD COLUMN input_tokens INTEGER;
+                 ALTER TABLE analyses ADD COLUMN output_tokens INTEGER;
+                 ALTER TABLE analyses ADD COLUMN cache_read_tokens INTEGER;
+                 ALTER TABLE analyses ADD COLUMN cache_creation_tokens INTEGER;
+                 ALTER TABLE analyses ADD COLUMN project_path TEXT;",
+            )?;
+        }
+        if version < SCHEMA_VERSION {
             conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         }
         let db = Db { conn };
-        let count: i64 = db.conn.query_row("SELECT COUNT(*) FROM criteria", [], |r| r.get(0))?;
-        if count == 0 {
+        let keys: Vec<String> = {
+            let mut stmt = db.conn.prepare("SELECT key FROM criteria ORDER BY key")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // Seed the rubric, and replace the untouched v1 default rubric with the current one.
+        let mut v1 = V1_DEFAULT_KEYS.to_vec();
+        v1.sort();
+        if keys.is_empty() || keys == v1 {
             db.save_criteria(&default_criteria())?;
         }
         Ok(db)
@@ -777,6 +777,11 @@ impl Db {
         Ok(self.conn.query_row("SELECT name FROM projects WHERE id = ?1", [id], |r| r.get(0))?)
     }
 
+    /// (folder, location) of a project.
+    pub fn project_folder(&self, id: i64) -> Result<(Option<String>, String)> {
+        Ok(self.conn.query_row("SELECT path, location FROM projects WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?)
+    }
+
     pub fn rename_project(&self, id: i64, name: &str) -> Result<()> {
         self.conn.execute("UPDATE projects SET name = ?2 WHERE id = ?1", params![id, name.trim()])?;
         Ok(())
@@ -918,100 +923,50 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    // ---------------------------------------------------------------- stats
+    // ---------------------------------------------------------------- dashboard
 
-    pub fn stats(&self, days: i64) -> Result<Stats> {
-        let mut st = Stats::default();
-        self.conn.query_row(
-            "SELECT COUNT(DISTINCT project_id), COUNT(*), COALESCE(SUM(prompt_count),0), COALESCE(SUM(tool_call_count),0),
-                COALESCE(SUM(error_count),0), SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens),
-                SUM(cache_creation_tokens), COALESCE(SUM(est_cost), 0)
-             FROM sessions",
+    /// Most recently active sessions across all projects.
+    pub fn recent_sessions(&self, limit: i64) -> Result<Vec<SessionSummary>> {
+        let sql = format!("SELECT {SESSION_COLS} FROM sessions s ORDER BY s.ended_at DESC LIMIT ?1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([limit], session_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Sessions with activity at or after `since` (UTC ISO timestamp).
+    pub fn sessions_active_since(&self, since: &str) -> Result<Vec<SessionSummary>> {
+        let sql = format!(
+            "SELECT {SESSION_COLS} FROM sessions s WHERE s.ended_at >= ?1 AND s.prompt_count > 0 ORDER BY s.ended_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([since], session_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// (created_at, score, scope) of finished analyses since `since`, oldest first.
+    pub fn score_history(&self, since: &str) -> Result<Vec<ScorePoint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, overall_score, scope FROM analyses
+             WHERE status = 'done' AND overall_score IS NOT NULL AND scope != 'draft' AND created_at >= ?1
+             ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([since], |r| {
+            Ok(ScorePoint { analysis_id: r.get(0)?, created_at: r.get(1)?, score: r.get(2)?, scope: r.get(3)? })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn counts(&self) -> Result<Counts> {
+        Ok(self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM projects p WHERE p.merged_into IS NULL AND EXISTS (SELECT 1 FROM sessions s WHERE s.project_id = p.id)),
+                    (SELECT COUNT(*) FROM sessions), (SELECT COALESCE(SUM(prompt_count), 0) FROM sessions),
+                    (SELECT COUNT(*) FROM analyses WHERE status = 'done'),
+                    (SELECT COUNT(*) FROM analyses WHERE status = 'running')",
             [],
             |r| {
-                st.projects = r.get(0)?;
-                st.sessions = r.get(1)?;
-                st.prompts = r.get(2)?;
-                st.tool_calls = r.get(3)?;
-                st.tool_errors = r.get(4)?;
-                st.tokens = tokens_from(r, 5)?;
-                st.est_cost = r.get(9)?;
-                Ok(())
+                Ok(Counts { projects: r.get(0)?, sessions: r.get(1)?, prompts: r.get(2)?, analyses: r.get(3)?, running_analyses: r.get(4)? })
             },
-        )?;
-        st.analyses = self.conn.query_row("SELECT COUNT(*) FROM analyses WHERE status = 'done'", [], |r| r.get(0))?;
-
-        let mut stmt = self.conn.prepare(
-            "SELECT substr(started_at, 1, 10) AS day, COUNT(*), SUM(prompt_count), COALESCE(SUM(est_cost), 0)
-             FROM sessions WHERE started_at >= date('now', ?1)
-             GROUP BY day ORDER BY day",
-        )?;
-        st.by_day = stmt
-            .query_map([format!("-{days} days")], |r| {
-                Ok(DayStat { day: r.get(0)?, sessions: r.get(1)?, prompts: r.get(2)?, est_cost: r.get(3)? })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-
-        let mut stmt = self.conn.prepare(
-            "SELECT model, COUNT(*), SUM(i), SUM(o), SUM(cr), SUM(cc) FROM (
-                SELECT MAX(model) AS model, MAX(input_tokens) AS i, MAX(output_tokens) AS o,
-                       MAX(cache_read_tokens) AS cr, MAX(cache_creation_tokens) AS cc
-                FROM messages WHERE api_msg_id IS NOT NULL AND model IS NOT NULL GROUP BY session_id, api_msg_id
-             ) GROUP BY model ORDER BY SUM(o) DESC",
-        )?;
-        st.by_model = stmt
-            .query_map([], |r| {
-                let model: String = r.get(0)?;
-                let u = Usage {
-                    input_tokens: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-                    output_tokens: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                    cache_read_tokens: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                    cache_creation_tokens: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
-                };
-                Ok(ModelStat {
-                    est_cost: pricing::estimate(&model, &u),
-                    model,
-                    responses: r.get(1)?,
-                    output_tokens: u.output_tokens,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        // Codex sessions report usage per session, not per message.
-        let mut stmt = self.conn.prepare(
-            "SELECT COALESCE(models, 'codex'), COUNT(*), SUM(output_tokens) FROM sessions WHERE source = 'codex' GROUP BY models",
-        )?;
-        let codex: Vec<ModelStat> = stmt
-            .query_map([], |r| {
-                Ok(ModelStat { model: r.get(0)?, responses: r.get(1)?, output_tokens: r.get::<_, Option<i64>>(2)?.unwrap_or(0), est_cost: None })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        st.by_model.extend(codex);
-
-        let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.name, COUNT(s.id), SUM(s.prompt_count), SUM(s.output_tokens), COALESCE(SUM(s.est_cost), 0)
-             FROM projects p JOIN sessions s ON s.project_id = p.id
-             GROUP BY p.id ORDER BY SUM(s.prompt_count) DESC",
-        )?;
-        st.by_project = stmt
-            .query_map([], |r| {
-                Ok(ProjectStat {
-                    project_id: r.get(0)?,
-                    name: r.get(1)?,
-                    sessions: r.get(2)?,
-                    prompts: r.get(3)?,
-                    output_tokens: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                    est_cost: r.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-
-        let mut stmt = self.conn.prepare(
-            "SELECT source, location, COUNT(*), SUM(prompt_count) FROM sessions GROUP BY source, location ORDER BY COUNT(*) DESC",
-        )?;
-        st.by_source = stmt
-            .query_map([], |r| Ok(SourceStat { source: r.get(0)?, location: r.get(1)?, sessions: r.get(2)?, prompts: r.get(3)? }))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(st)
+        )?)
     }
 
     // ---------------------------------------------------------------- criteria
@@ -1051,8 +1006,8 @@ impl Db {
 
     pub fn create_analysis(&self, a: &NewAnalysis) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO analyses(scope, target_id, model, context_mode, status, created_at, input_text, ref_map_json, truncated)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8)",
+            "INSERT INTO analyses(scope, target_id, model, context_mode, status, created_at, input_text, ref_map_json, truncated, project_path)
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8, ?9)",
             params![
                 a.scope,
                 a.target_id,
@@ -1061,7 +1016,8 @@ impl Db {
                 now(),
                 a.input_text,
                 a.ref_map.map(|v| v.to_string()),
-                a.truncated as i64
+                a.truncated as i64,
+                a.project_path
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -1075,20 +1031,32 @@ impl Db {
         raw: &str,
         cost: Option<f64>,
         duration_ms: Option<i64>,
+        usage: Option<&Usage>,
     ) -> Result<()> {
         self.conn.execute(
             "UPDATE analyses SET status = 'done', finished_at = ?2, overall_score = ?3, result_json = ?4,
                 raw_output = ?5, cost_usd = ?6, duration_ms = ?7 WHERE id = ?1",
             params![id, now(), score, result.to_string(), raw, cost, duration_ms],
         )?;
-        Ok(())
+        self.set_analysis_usage(id, usage)
     }
 
-    pub fn fail_analysis(&self, id: i64, error: &str, raw: Option<&str>) -> Result<()> {
+    /// Record a failure. A failed run can still have used tokens (e.g. unparseable reply).
+    pub fn fail_analysis(&self, id: i64, error: &str, raw: Option<&str>, cost: Option<f64>, usage: Option<&Usage>) -> Result<()> {
         self.conn.execute(
-            "UPDATE analyses SET status = 'error', finished_at = ?2, error = ?3, raw_output = ?4 WHERE id = ?1",
-            params![id, now(), error, raw],
+            "UPDATE analyses SET status = 'error', finished_at = ?2, error = ?3, raw_output = ?4, cost_usd = ?5 WHERE id = ?1",
+            params![id, now(), error, raw, cost],
         )?;
+        self.set_analysis_usage(id, usage)
+    }
+
+    fn set_analysis_usage(&self, id: i64, usage: Option<&Usage>) -> Result<()> {
+        if let Some(u) = usage {
+            self.conn.execute(
+                "UPDATE analyses SET input_tokens = ?2, output_tokens = ?3, cache_read_tokens = ?4, cache_creation_tokens = ?5 WHERE id = ?1",
+                params![id, u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_creation_tokens],
+            )?;
+        }
         Ok(())
     }
 

@@ -5,6 +5,7 @@ import { errorMessage, locationLabel } from "../lib/format";
 import { useNav } from "../lib/router";
 import { ErrorBox, Icon, Loading } from "../components/ui";
 import { invalidateCriteriaCache } from "../components/AnalysisView";
+import { useUpdateStatus } from "../lib/update";
 
 function SourcesCard({ settings, update }: { settings: AppSettings; update: (s: AppSettings) => void }) {
   const nav = useNav();
@@ -181,16 +182,17 @@ function AnalysisCard({ settings, update }: { settings: AppSettings; update: (s:
           </select>
         </label>
         <label className="field">
-          Max input size (characters)
+          Max input size (tokens)
           <input
             className="input"
             type="number"
-            min={20000}
-            step={10000}
-            value={settings.maxContextChars}
-            onChange={(e) => update({ ...settings, maxContextChars: Number(e.target.value) })}
+            min={50000}
+            max={4000000}
+            step={50000}
+            value={settings.maxInputTokens}
+            onChange={(e) => update({ ...settings, maxInputTokens: Number(e.target.value) })}
           />
-          <span className="muted small">≈ {Math.round(settings.maxContextChars / 4).toLocaleString()} tokens</span>
+          <span className="muted small">Default 1,000,000 (the context window of current Claude models). Larger inputs are reduced to fit.</span>
         </label>
         <label className="field">
           Timeout per analysis (minutes)
@@ -313,6 +315,72 @@ function RubricCard() {
   );
 }
 
+function UpdatesCard() {
+  const nav = useNav();
+  const status = useUpdateStatus();
+  const [checking, setChecking] = useState(false);
+  const check = async () => {
+    setChecking(true);
+    try {
+      const s = await api.checkForUpdates();
+      if (s.state === "up-to-date") nav.toast("You have the latest version");
+    } catch (e) {
+      nav.toast(errorMessage(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+  const install = async () => {
+    try {
+      await api.installUpdate();
+    } catch (e) {
+      nav.toast(errorMessage(e));
+    }
+  };
+  const busy = checking || status?.state === "checking" || status?.state === "downloading";
+  return (
+    <div className="card">
+      <h2>Updates</h2>
+      <p className="muted small" style={{ marginTop: 0 }}>
+        The app checks for new versions when it starts and every 6 hours, and downloads them in the background. Click “Restart to update”, or the
+        update is installed quietly the next time the app starts.
+      </p>
+      <div className="row wrap">
+        <span>
+          Installed: <b>{status?.currentVersion ?? "…"}</b>
+          {status?.latestVersion && status.latestVersion !== status.currentVersion && (
+            <>
+              {" "}
+              · Available: <b>{status.latestVersion}</b>
+            </>
+          )}
+        </span>
+        <span className="spacer" />
+        {status?.state === "ready" ? (
+          <button className="btn primary" onClick={install}>
+            Restart to update
+          </button>
+        ) : (
+          <button className="btn" onClick={check} disabled={busy}>
+            {busy ? <span className="spinner" /> : <Icon name="refresh" size={14} />} Check for updates
+          </button>
+        )}
+      </div>
+      {status?.state === "downloading" && (
+        <div className="progress" style={{ marginTop: 10 }}>
+          <div style={{ width: `${Math.round((status.progress ?? 0) * 100)}%` }} />
+        </div>
+      )}
+      <div className="small" style={{ marginTop: 8 }}>
+        {status?.state === "up-to-date" && <span style={{ color: "var(--good)" }}>✓ You have the latest version.</span>}
+        {status?.state === "error" && <span className="error-text">Update check failed: {status.error}</span>}
+        {status?.checkedAt && <span className="muted"> Last checked {new Date(status.checkedAt).toLocaleString()}.</span>}
+      </div>
+      {status?.notes && status.state === "ready" && <div className="preview-text" style={{ marginTop: 8, maxHeight: 160 }}>{status.notes}</div>}
+    </div>
+  );
+}
+
 function AboutCard() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [ret, setRet] = useState<RetentionStatus | null>(null);
@@ -393,6 +461,7 @@ export function SettingsPage() {
       <CliCard settings={settings} update={update} />
       <AnalysisCard settings={settings} update={update} />
       <RubricCard />
+      <UpdatesCard />
       <AboutCard />
     </div>
   );

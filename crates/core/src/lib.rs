@@ -13,5 +13,6 @@ pub mod model;
 pub mod parse;
 pub mod pricing;
 pub mod redact;
+pub mod usage;
 
 pub use db::Db;

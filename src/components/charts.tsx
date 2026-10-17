@@ -36,7 +36,9 @@ export function ColumnChart({ data, height = 200, ariaLabel }: { data: ColumnDat
   const innerH = height - pad.top - pad.bottom;
   const slot = data.length ? innerW / data.length : innerW;
   const barW = Math.max(2, Math.min(24, slot - 2));
-  const labelEvery = Math.max(1, Math.ceil(data.length / 8));
+  // Keep at least ~64px per axis label so they never overlap.
+  const maxLabels = Math.max(2, Math.floor(innerW / 64));
+  const labelEvery = Math.max(1, Math.ceil(data.length / maxLabels));
 
   const hovered = hover != null ? data[hover] : null;
   const hx = hover != null ? pad.left + slot * hover + slot / 2 : 0;

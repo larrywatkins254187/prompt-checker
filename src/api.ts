@@ -130,6 +130,9 @@ export type AnalysisRow = {
   costUsd: number | null;
   durationMs: number | null;
   truncated: boolean;
+  /** Tokens the Claude CLI used for this analysis (null for runs made before v0.2). */
+  tokens: Tokens | null;
+  projectPath: string | null;
 };
 
 export type PromptScore = { messageId: number; score: number; analysisId: number };
@@ -141,9 +144,20 @@ export type AnalysisRequest = {
   model: string;
   draftText?: string | null;
   draftContext?: string | null;
+  /** Draft only: folder the model may explore read-only… */
+  projectDir?: string | null;
+  /** …or an imported project whose folder is used. */
+  projectId?: number | null;
 };
 
-export type BuiltContext = { chars: number; estTokens: number; promptCount: number; truncated: boolean; notes: string[] };
+export type BuiltContext = {
+  chars: number;
+  estTokens: number;
+  promptCount: number;
+  truncated: boolean;
+  notes: string[];
+  projectDir: string | null;
+};
 
 export type SourceKind = "claude" | "codex";
 export type SourceConfig = { id: string; kind: SourceKind; location: string; path: string; enabled: boolean; auto: boolean };
@@ -155,7 +169,7 @@ export type AppSettings = {
   models: string[];
   defaultModel: string;
   defaultMode: ContextMode;
-  maxContextChars: number;
+  maxInputTokens: number;
   redact: boolean;
   pollSeconds: number;
   timeoutMinutes: number;
@@ -179,19 +193,32 @@ export type RetentionStatus = {
   atRisk: boolean;
 };
 
-export type Stats = {
-  projects: number;
-  sessions: number;
-  prompts: number;
-  toolCalls: number;
-  toolErrors: number;
-  tokens: Tokens;
-  estCost: number;
-  analyses: number;
-  byDay: { day: string; sessions: number; prompts: number; estCost: number }[];
-  byModel: { model: string; responses: number; outputTokens: number; estCost: number | null }[];
-  byProject: { projectId: number; name: string; sessions: number; prompts: number; outputTokens: number; estCost: number }[];
+export type UsageRange = { from: string; to: string; tzOffsetMinutes: number; bucket: "hour" | "day" };
+export type UsageBucket = { key: string; sessions: number; prompts: number; tokens: Tokens; estCost: number };
+export type UsageReport = {
+  totals: { sessions: number; activeProjects: number; prompts: number; toolCalls: number; toolErrors: number; tokens: Tokens; estCost: number };
+  buckets: UsageBucket[];
+  byProject: { projectId: number; name: string; sessions: number; prompts: number; tokens: Tokens; estCost: number }[];
+  byModel: { model: string; responses: number; tokens: Tokens; estCost: number | null }[];
   bySource: { source: string; location: string; sessions: number; prompts: number }[];
+  analyses: { runs: number; failed: number; tokens: Tokens; costUsd: number };
+};
+
+export type Dashboard = {
+  counts: { projects: number; sessions: number; prompts: number; analyses: number; runningAnalyses: number };
+  recentSessions: SessionSummary[];
+  recentAnalyses: AnalysisRow[];
+  scoreHistory: { analysisId: number; createdAt: string; score: number; scope: Scope }[];
+};
+
+export type UpdateStatus = {
+  currentVersion: string;
+  state: "idle" | "checking" | "downloading" | "ready" | "up-to-date" | "error";
+  latestVersion: string | null;
+  notes: string | null;
+  progress: number | null;
+  error: string | null;
+  checkedAt: string | null;
 };
 
 export type AppInfo = { version: string; dbPath: string; workdir: string };
@@ -219,7 +246,12 @@ export const api = {
   promptScores: (sessionId: number) => invoke<PromptScore[]>("prompt_scores", { sessionId }),
   search: (query: string, kinds: string[], projectId: number | null) =>
     invoke<SearchHit[]>("search", { query, kinds, projectId }),
-  stats: (days = 90) => invoke<Stats>("stats", { days }),
+  usage: (range: UsageRange) => invoke<UsageReport>("usage", { range }),
+  dashboard: (scoreSince: string) => invoke<Dashboard>("dashboard", { scoreSince }),
+  sessionsActiveSince: (since: string) => invoke<SessionSummary[]>("sessions_active_since", { since }),
+  updateStatus: () => invoke<UpdateStatus>("update_status"),
+  checkForUpdates: () => invoke<UpdateStatus>("check_for_updates"),
+  installUpdate: () => invoke<void>("install_update"),
 
   listCriteria: () => invoke<Criterion[]>("list_criteria"),
   saveCriteria: (criteria: Criterion[]) => invoke<Criterion[]>("save_criteria", { criteria }),
@@ -239,7 +271,7 @@ export const api = {
   exportAnalysis: (id: number, format: "md" | "json", path: string) => invoke<void>("export_analysis", { id, format, path }),
 };
 
-export function onEvent<T>(name: "ingest-status" | "analysis-updated", handler: (payload: T) => void): () => void {
+export function onEvent<T>(name: "ingest-status" | "analysis-updated" | "update-status", handler: (payload: T) => void): () => void {
   let unlisten: UnlistenFn | null = null;
   let disposed = false;
   listen<T>(name, (e) => handler(e.payload)).then((u) => {

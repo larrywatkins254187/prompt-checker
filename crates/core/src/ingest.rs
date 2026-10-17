@@ -264,6 +264,19 @@ pub mod wsl {
         run_wsl(&["-l", "-q", "--running"]).map(|s| parse_list(&s)).unwrap_or_default()
     }
 
+    /// Path usable from this host for a folder recorded by a session. Paths recorded inside
+    /// WSL (`/home/me/app` with location `wsl:Ubuntu`) become `\\wsl.localhost\Ubuntu\home\me\app`.
+    pub fn host_path(location: &str, path: &str) -> PathBuf {
+        if let Some(distro) = location.strip_prefix("wsl:") {
+            if path.starts_with('/') {
+                if let Some(root) = root(distro) {
+                    return root.join(path.trim_start_matches('/').replace('/', "\\"));
+                }
+            }
+        }
+        PathBuf::from(path)
+    }
+
     /// UNC root of a distro's filesystem.
     pub fn root(distro: &str) -> Option<PathBuf> {
         if !cfg!(windows) {

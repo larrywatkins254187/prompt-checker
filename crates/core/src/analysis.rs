@@ -69,6 +69,12 @@ pub struct AnalysisRequest {
     pub draft_text: Option<String>,
     /// Draft scope only: optional notes about the project/situation.
     pub draft_context: Option<String>,
+    /// Draft scope only: project folder the model may explore read-only.
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    /// Draft scope only: imported project whose folder should be used (resolved to `project_dir`).
+    #[serde(default)]
+    pub project_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +91,37 @@ pub struct BuiltContext {
     pub prompt_count: usize,
     pub truncated: bool,
     pub notes: Vec<String>,
+    /// Folder the CLI runs in with read-only tools (draft reviews with a project).
+    pub project_dir: Option<String>,
+}
+
+/// Room kept free for the reviewer instructions and the model's reply.
+const RESERVED_TOKENS: usize = 40_000;
+
+/// Rough token count: ~4 characters per token for ASCII text, ~1.5 for other scripts
+/// (Persian, CJK, …), which tokenise much more densely. Deliberately on the high side.
+pub fn estimate_tokens(text: &str) -> usize {
+    let (mut ascii, mut other) = (0usize, 0usize);
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            other += 1;
+        }
+    }
+    ascii / 4 + other * 2 / 3 + 1
+}
+
+/// Longest prefix of `text` whose estimate fits in `budget` tokens.
+fn cut_to_tokens(text: &str, budget: usize) -> &str {
+    let mut used = 0f64;
+    for (i, c) in text.char_indices() {
+        used += if c.is_ascii() { 0.25 } else { 0.667 };
+        if used > budget as f64 {
+            return &text[..i];
+        }
+    }
+    text
 }
 
 const ITEM_CAP_FULL: usize = 12_000;
@@ -223,8 +260,9 @@ fn session_header(db: &Db, session_id: i64, index: Option<usize>) -> Result<Stri
     ))
 }
 
-/// Build the text sent to the model, fitting it into `max_chars`.
-pub fn build_context(db: &Db, req: &AnalysisRequest, criteria: &[Criterion], max_chars: usize, do_redact: bool) -> Result<BuiltContext> {
+/// Build the text sent to the model, fitting it into `max_input_tokens` (estimated).
+pub fn build_context(db: &Db, req: &AnalysisRequest, criteria: &[Criterion], max_input_tokens: usize, do_redact: bool) -> Result<BuiltContext> {
+    let budget = max_input_tokens.saturating_sub(RESERVED_TOKENS).max(1_000);
     let mut notes = Vec::new();
     let mut truncated = false;
     let target_prompt = (req.scope == Scope::Prompt).then_some(req.target_id).flatten();
@@ -238,6 +276,9 @@ pub fn build_context(db: &Db, req: &AnalysisRequest, criteria: &[Criterion], max
             let mut body = String::new();
             if let Some(ctx) = req.draft_context.as_deref().filter(|c| !c.trim().is_empty()) {
                 body.push_str(&format!("SITUATION / PROJECT NOTES FROM THE USER:\n{}\n\n", ctx.trim()));
+            }
+            if let Some(dir) = req.project_dir.as_deref().filter(|d| !d.trim().is_empty()) {
+                body.push_str(&format!("PROJECT: the prompt is for the project in your current working directory ({dir}).\n\n"));
             }
             body.push_str(&format!("[DRAFT] PROMPT THE USER IS ABOUT TO SEND TO A CODING AGENT:\n{draft}\n"));
             let refs = Labeler { next: 0, refs: vec![json!({"ref": "DRAFT"})] };
@@ -261,7 +302,7 @@ pub fn build_context(db: &Db, req: &AnalysisRequest, criteria: &[Criterion], max
                 (sid, db.session_messages(sid, false)?)
             };
             let blocks = vec![SessionBlock { header: session_header(db, session_id, None)?, session_id, messages }];
-            fit(&blocks, req.mode, max_chars, target_prompt, &mut notes, &mut truncated)
+            fit(&blocks, req.mode, budget, target_prompt, &mut notes, &mut truncated)
         }
         Scope::Project | Scope::Global => {
             let session_ids: Vec<(i64, String)> = if req.scope == Scope::Project {
@@ -292,7 +333,7 @@ pub fn build_context(db: &Db, req: &AnalysisRequest, criteria: &[Criterion], max
             if blocks.is_empty() {
                 bail!("No prompts found to analyse");
             }
-            fit(&blocks, req.mode, max_chars, None, &mut notes, &mut truncated)
+            fit(&blocks, req.mode, budget, None, &mut notes, &mut truncated)
         }
     };
 
@@ -301,18 +342,28 @@ pub fn build_context(db: &Db, req: &AnalysisRequest, criteria: &[Criterion], max
         bail!("No prompts found to analyse");
     }
     let body = if do_redact { redact(&body) } else { body };
-    let system_prompt = system_prompt(req.scope, criteria);
+    let project_dir = if req.scope == Scope::Draft {
+        req.project_dir.clone().filter(|d| !d.trim().is_empty())
+    } else {
+        None
+    };
+    let mut system_prompt = system_prompt(req.scope, criteria);
+    if project_dir.is_some() {
+        system_prompt.push_str(EXPLORE_INSTRUCTIONS);
+    }
     let user_prompt = user_prompt(req.scope, &body, &notes);
-    let chars = system_prompt.len() + user_prompt.len();
+    let chars = system_prompt.chars().count() + user_prompt.chars().count();
+    let est_tokens = estimate_tokens(&system_prompt) + estimate_tokens(&user_prompt);
     Ok(BuiltContext {
         system_prompt,
         user_prompt,
         ref_map: Value::Array(labeler.refs),
         chars,
-        est_tokens: chars / 4,
+        est_tokens,
         prompt_count,
         truncated,
         notes,
+        project_dir,
     })
 }
 
@@ -321,7 +372,7 @@ pub fn build_context(db: &Db, req: &AnalysisRequest, criteria: &[Criterion], max
 fn fit(
     blocks: &[SessionBlock],
     mode: ContextMode,
-    max_chars: usize,
+    budget: usize,
     target: Option<i64>,
     notes: &mut Vec<String>,
     truncated: &mut bool,
@@ -329,7 +380,7 @@ fn fit(
     let mut m = mode;
     loop {
         let (text, labeler) = render_blocks(blocks, m, target);
-        if text.len() <= max_chars {
+        if estimate_tokens(&text) <= budget {
             if m != mode {
                 notes.push(format!("Context was too large for '{}' mode; sent in '{}' mode instead.", mode.as_str(), m.as_str()));
                 *truncated = true;
@@ -350,27 +401,30 @@ fn fit(
     let mut size = 0usize;
     while start > 0 {
         let (t, _) = render_blocks(&blocks[start - 1..start], m, target);
-        if size + t.len() > max_chars && start < blocks.len() {
+        let n = estimate_tokens(&t);
+        if size + n > budget && start < blocks.len() {
             break;
         }
-        size += t.len();
+        size += n;
         start -= 1;
     }
     if start > 0 {
         notes.push(format!("Only the {} most recent of {} sessions fit; older ones were left out.", blocks.len() - start, blocks.len()));
     }
     let (mut text, labeler) = render_blocks(&blocks[start..], m, target);
-    if text.len() > max_chars {
-        let mut cutoff = max_chars;
-        while !text.is_char_boundary(cutoff) {
-            cutoff -= 1;
-        }
-        text.truncate(cutoff);
+    if estimate_tokens(&text) > budget {
+        let keep = cut_to_tokens(&text, budget).len();
+        text.truncate(keep);
         text.push_str("\n…[cut to fit the context budget]\n");
         notes.push("The transcript was cut to fit the context budget.".into());
     }
     (text, labeler)
 }
+
+const EXPLORE_INSTRUCTIONS: &str = r#"
+
+PROJECT ACCESS: your current working directory is the developer's project. Before answering, use the Read, Glob and Grep tools to learn what the prompt depends on: README, CLAUDE.md or AGENTS.md, the project layout, and the files, modules, tests and commands the prompt touches or should mention. Keep it focused (about 20 tool calls at most). You cannot and must not modify anything.
+Use what you find to judge the prompt (missing context the agent would need, wrong assumptions, names that do not exist) and to make the rewrite concrete: real file paths, existing conventions, the actual test/build commands. Name the files you looked at in the summary. Your final message must still be ONLY the JSON object."#;
 
 fn criteria_block(criteria: &[Criterion]) -> String {
     criteria
@@ -547,7 +601,7 @@ mod tests {
     }
 
     fn req(scope: Scope, target: i64, mode: ContextMode) -> AnalysisRequest {
-        AnalysisRequest { scope, target_id: Some(target), mode, model: "sonnet".into(), draft_text: None, draft_context: None }
+        AnalysisRequest { scope, target_id: Some(target), mode, model: "sonnet".into(), draft_text: None, draft_context: None, project_dir: None, project_id: None }
     }
 
     #[test]
@@ -561,7 +615,7 @@ mod tests {
         assert!(c.user_prompt.contains("[REDACTED]"));
         assert!(!c.user_prompt.contains("sk-ant-"));
         assert!(!c.user_prompt.contains(&"x".repeat(400)), "condensed mode must not include long tool output");
-        assert!(c.system_prompt.contains("\"clarity\""));
+        assert!(c.system_prompt.contains("\"goal\""));
 
         let prompts = build_context(&db, &req(Scope::Session, sid, ContextMode::Prompts), &default_criteria(), 100_000, true).unwrap();
         assert!(!prompts.user_prompt.contains("ASSISTANT"));
@@ -591,10 +645,11 @@ mod tests {
 
     #[test]
     fn parses_fenced_json_and_fills_defaults() {
-        let reply = "Here you go:\n```json\n{\"criteria\":[{\"key\":\"clarity\",\"score\":12},{\"key\":\"context\",\"score\":\"4\"}],\"summary\":\"ok\"}\n```";
+        // goal weighs 1.5, efficiency 0.5 -> (10*1.5 + 4*0.5) / 2 = 8.5
+        let reply = "Here you go:\n```json\n{\"criteria\":[{\"key\":\"goal\",\"score\":12},{\"key\":\"efficiency\",\"score\":\"4\"}],\"summary\":\"ok\"}\n```";
         let (v, score) = parse_result(reply, &default_criteria()).unwrap();
         assert_eq!(v["criteria"][0]["score"], json!(10.0));
-        assert_eq!(score, Some(7.0));
+        assert_eq!(score, Some(8.5));
         assert!(v["mistakes"].is_array());
         assert!(parse_result("no json here", &default_criteria()).is_err());
     }

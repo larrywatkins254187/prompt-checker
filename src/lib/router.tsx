@@ -1,6 +1,7 @@
 import { createContext, useContext } from "react";
 
 export type Route =
+  | { name: "dashboard" }
   | { name: "projects" }
   | { name: "project"; id: number; tab?: "sessions" | "analyses" }
   | { name: "session"; id: number; focus?: number }
